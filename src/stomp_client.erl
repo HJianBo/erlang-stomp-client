@@ -12,23 +12,38 @@
 -behaviour(gen_server).
 
 %% API
--export([start/5,stop/1,subscribe_topic/3,subscribe_queue/3,
-	 unsubscribe_topic/2,unsubscribe_queue/2,
-	 ack/2, ack/3, send_topic/4, send_queue/4,test/0]).
+-export([ start/5
+        , stop/1
+        , subscribe_topic/3
+        , subscribe_queue/3
+        , unsubscribe_topic/2
+        , unsubscribe_queue/2
+        , ack/2
+        , ack/3
+        , send_topic/4
+        , send_queue/4
+        ,test/0
+        ]).
 
 %% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2,
-	 terminate/2, code_change/3]).
+-export([ init/1
+        , handle_call/3
+        , handle_cast/2
+        , handle_info/2
+        , terminate/2
+        , code_change/3
+        ]).
 
 -export([start/6, get_client_state/1]).
--define(SERVER, ?MODULE). 
 
--record(state, {framer, socket, subscriptions,onmessage, client_state}).
+-record(state, {framer, socket, subscriptions, subno, onmessage, client_state}).
+
 -record(framer_state,
 	{
 	  current = [],
 	  messages = []
 	}).
+
 -record(parser_state,
 	{
 	  current = [],
@@ -114,16 +129,19 @@ start_link(Host,Port,User,Pass,MessageFunc,ClientState) ->
 %%% gen_server callbacks
 %%%===================================================================
 %%% @hidden
+
+random_clientid() ->
+    "erlang_stomp_" ++ [$a + rand:uniform(26) || _ <- lists:seq(1,5)].
+
 init([{Host,Port,User,Pass,F}]) ->
-    {uuid, UUID} = zuuid:v4(),
-    ClientId = "erlang_stomp_"++binary_to_list(UUID),
-    Message=lists:append(["CONNECT", "\nlogin: ", User, "\npasscode: ", Pass,"\nclient-id:",ClientId, "\n\n", [0]]),
+    ClientId = random_clientid(),
+    Message=lists:append(["CONNECT", "\nlogin:", User, "\npasscode:", Pass,"\nclient-id:",ClientId, "\n\n", [0]]),
     {ok,Sock}=gen_tcp:connect(Host,Port,[{active, false}]),
     gen_tcp:send(Sock,Message),    
     {ok, Response}=gen_tcp:recv(Sock, 0),
     State = frame(Response, #framer_state{}),
     inet:setopts(Sock,[{active,once}]),
-    {ok, #state{framer = State, socket = Sock, onmessage = F}};
+    {ok, #state{framer = State, socket = Sock, onmessage = F, subno = 1, subscriptions = #{}}};
 
 init([{Host,Port,User,Pass,F,Cl}]) ->
     {ok, State} = init([{Host,Port,User,Pass,F}]),
@@ -139,29 +157,42 @@ handle_call(_Request, _From, State) ->
     {reply, Reply, State}.
 
 %%% @hidden
-handle_cast({subscribe, topic ,Topic, Options}, #state{socket = Sock} = State) ->
-    Message = lists:append(["SUBSCRIBE", "\ndestination: ", "/topic/"++Topic,format_options(Options) ,"\n\n", [0]]),
+handle_cast({subscribe, Type, Topic, Options},
+            #state{socket = Sock, subscriptions = Subscriptions, subno = SubNo} = State)
+    when Type == topic;
+         Type == queue ->
+    Id = integer_to_list(SubNo),
+    NTopic = case Type of
+                 topic -> "/topic/" ++ Topic;
+                 queue -> "/queue/" ++ Topic
+             end,
+    Message = lists:append(["SUBSCRIBE",
+                            "\nid:", Id,
+                            "\ndestination:", NTopic, format_options(Options),
+                            "\n\n", [0]]
+                          ),
     gen_tcp:send(Sock,Message),   
     inet:setopts(Sock,[{active,once}]),
-    {noreply, State#state{subscriptions = [State#state.subscriptions|Topic]}};
+    NSubscriptions = maps:put(SubNo, Topic, Subscriptions),
+    {noreply, State#state{subno = SubNo + 1,
+                          subscriptions = NSubscriptions}};
 
 %%% @hidden
-handle_cast({subscribe, queue ,Queue,Options}, #state{socket = Sock} = State) ->
-    Message = lists:append(["SUBSCRIBE", "\ndestination: ", "/queue/"++Queue,format_options(Options) ,"\n\n", [0]]),
+handle_cast({unsubscribe, Type, Topic},
+            #state{socket = Sock, subscriptions = Subscriptions} = State)
+    when Type == topic;
+         Type == queue ->
+    Id = find_key_by_value(Topic, Subscriptions),
+    Message=lists:append(["UNSUBSCRIBE",
+                          "\nid:", integer_to_list(Id),
+                          "\n\n", [0]]),
     gen_tcp:send(Sock,Message),   
     inet:setopts(Sock,[{active,once}]),
-    {noreply, State#state{subscriptions = [State#state.subscriptions|Queue]}};
-
-%%% @hidden
-handle_cast({unsubscribe, topic ,Topic}, #state{socket = Sock} = State) ->
-    Message=lists:append(["UNSUBSCRIBE", "\ndestination: ", "/topic/"++Topic, "\n\n", [0]]),
-    gen_tcp:send(Sock,Message),   
-    inet:setopts(Sock,[{active,once}]),
-    {noreply, State#state{subscriptions = [State#state.subscriptions|Topic]}};
+    {noreply, State#state{subscriptions = maps:remove(Id, Subscriptions)}};
 
 %%% @hidden
 handle_cast({unsubscribe, queue ,Queue}, #state{socket = Sock} = State) ->
-    Message=lists:append(["UNSUBSCRIBE", "\ndestination: ", "/queue/"++Queue, "\n\n", [0]]),
+    Message=lists:append(["UNSUBSCRIBE", "\ndestination:", "/queue/"++Queue, "\n\n", [0]]),
     gen_tcp:send(Sock,Message),   
     inet:setopts(Sock,[{active,once}]),
     {noreply, State#state{subscriptions = [State#state.subscriptions|Queue]}};
@@ -215,7 +246,8 @@ handle_cast({send, queue, {Queue, Message,Options}},#state{socket = Socket} = St
     {noreply,State};
 
 %%% @hidden
-handle_cast(_Msg, State) ->    
+handle_cast(_Msg, State) ->
+    logger:error("Unexcepted msg: ~p~n", [_Msg]),
     {noreply, State}.
 
 %%% @hidden
@@ -242,6 +274,18 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+find_key_by_value(V, Map) ->
+    Find = fun _F({K, V0, I}) ->
+                   case V0 == V of
+                       true -> K;
+                       _ -> _F(maps:next(I))
+                   end;
+               _F(none) ->
+                   throw(badarg)
+           end,
+    Find(maps:next(maps:iterator(Map))).
+
 do_framing(Data, Framer, Func, Cl) ->
     case frame(Data,Framer) of
 	#framer_state{messages = []} = N ->
